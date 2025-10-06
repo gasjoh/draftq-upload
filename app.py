@@ -5,6 +5,7 @@ from typing import Optional
 
 from flask import Flask, request, jsonify, make_response
 from werkzeug.utils import secure_filename
+from flask_cors import CORS  # ✅ Allow WordPress to call this API
 
 # --- Optional S3 imports (only used if env vars are present) ---
 try:
@@ -17,7 +18,7 @@ except Exception:
 # =========================
 # Config
 # =========================
-ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*")
+ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "https://www.draftq.ae")  # ✅ Restrict CORS to your site
 MAX_FILE_MB = int(os.environ.get("MAX_FILE_MB", "30"))
 ALLOWED_EXTS = {".pdf"}
 
@@ -36,31 +37,18 @@ USE_S3 = all([S3_BUCKET, S3_REGION, S3_ACCESS_KEY, S3_SECRET_KEY, boto3 is not N
 # Flask app
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_FILE_MB * 1024 * 1024
+CORS(app, origins=[ALLOWED_ORIGIN])  # ✅ Enable CORS for your site only
 
 
 # =========================
 # Helpers
 # =========================
-def cors(resp):
-    resp.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
-    resp.headers["Vary"] = "Origin"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-    resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS, GET"
-    return resp
-
-
-@app.after_request
-def add_cors(r):
-    return cors(r)
-
-
 def allowed_fileext(filename: str) -> bool:
     ext = os.path.splitext(filename)[1].lower()
     return ext in ALLOWED_EXTS
 
 
 def s3_client():
-    # Create per-request client (simple, stateless)
     return boto3.client(
         "s3",
         region_name=S3_REGION,
@@ -107,6 +95,7 @@ def s3_presigned_get(key: str, expires_seconds: int = 3600) -> Optional[str]:
 # =========================
 @app.route("/api/health", methods=["GET"])
 def health():
+    """Quick health check for Render"""
     mode = "s3" if USE_S3 else "local"
     return jsonify(
         {
@@ -120,54 +109,53 @@ def health():
 
 @app.route("/api/upload", methods=["OPTIONS"])
 def preflight():
-    # Empty 204 with CORS headers for browsers
-    return cors(make_response(("", 204)))
+    """CORS preflight"""
+    resp = make_response(("", 204))
+    resp.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
+    resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    return resp
 
 
 @app.route("/api/upload", methods=["POST"])
 def upload():
-    # Read form data
+    """Handle file upload (PDF only) and send to S3"""
+    file = request.files.get("file")
     name = (request.form.get("name") or "").strip()
     email = (request.form.get("email") or "").strip()
     company = (request.form.get("company") or "").strip()
-    file = request.files.get("file")
 
     # Basic validation
-    if not name or not email or not file:
-        return (
-            jsonify({"status": "error", "error": "name, email, file required"}),
-            400,
-        )
-
-    original = secure_filename(file.filename or "")
-    if not original or not allowed_fileext(original):
+    if not file:
+        return jsonify({"status": "error", "error": "file required"}), 400
+    if not allowed_fileext(file.filename):
         return jsonify({"status": "error", "error": "Only PDF files allowed"}), 400
 
     item_id = str(uuid.uuid4())
-    ext = os.path.splitext(original)[1].lower()  # .pdf
+    ext = os.path.splitext(file.filename)[1].lower()
     stored_filename = f"input{ext}"
 
-    # Where we store (S3 or local)
     if USE_S3:
-        # Keys like: uploads/<uuid>/{input.pdf, meta.txt}
         base_key = f"uploads/{item_id}/"
         pdf_key = base_key + stored_filename
         meta_key = base_key + "meta.txt"
 
         try:
-            # Upload PDF
+            # Upload the PDF file
             s3_put_fileobj(pdf_key, file, "application/pdf")
 
-            # Upload META
-            meta = (
+            # Create meta file (optional info)
+            meta_data = (
                 f"id={item_id}\n"
-                f"name={name}\nemail={email}\ncompany={company}\n"
-                f"original_filename={original}\n"
+                f"name={name}\n"
+                f"email={email}\n"
+                f"company={company}\n"
+                f"original_filename={file.filename}\n"
                 f"uploaded_at_utc={datetime.datetime.utcnow().isoformat()}Z\n"
             ).encode("utf-8")
-            s3_put_bytes(meta_key, meta, "text/plain; charset=utf-8")
+            s3_put_bytes(meta_key, meta_data, "text/plain; charset=utf-8")
 
-            presigned = s3_presigned_get(pdf_key, 3600)
+            presigned_url = s3_presigned_get(pdf_key, 3600)
             return (
                 jsonify(
                     {
@@ -177,45 +165,47 @@ def upload():
                         "bucket": S3_BUCKET,
                         "pdf_key": pdf_key,
                         "meta_key": meta_key,
-                        "pdf_url": presigned,  # may be None if generation failed
+                        "pdf_url": presigned_url,
                     }
                 ),
                 201,
             )
+
         except (BotoCoreError, ClientError) as e:
-            return jsonify({"status": "error", "error": "S3 upload failed", "detail": str(e)}), 500
-
-    else:
-        # Local disk storage
-        folder = os.path.join(UPLOAD_DIR, item_id)
-        os.makedirs(folder, exist_ok=True)
-
-        # Save PDF
-        pdf_path = os.path.join(folder, stored_filename)
-        file.save(pdf_path)
-
-        # Save META
-        meta_path = os.path.join(folder, "meta.txt")
-        with open(meta_path, "w", encoding="utf-8") as f:
-            f.write(
-                f"id={item_id}\nname={name}\nemail={email}\ncompany={company}\n"
-                f"original_filename={original}\n"
-                f"uploaded_at_utc={datetime.datetime.utcnow().isoformat()}Z\n"
+            return (
+                jsonify(
+                    {"status": "error", "error": "S3 upload failed", "detail": str(e)}
+                ),
+                500,
             )
 
-        return (
-            jsonify(
-                {
-                    "status": "ok",
-                    "id": item_id,
-                    "storage": "local",
-                    "folder": folder,
-                    "pdf_path": pdf_path,
-                    "meta_path": meta_path,
-                }
-            ),
-            201,
+    # Local fallback (if S3 not configured)
+    folder = os.path.join(UPLOAD_DIR, item_id)
+    os.makedirs(folder, exist_ok=True)
+    pdf_path = os.path.join(folder, stored_filename)
+    file.save(pdf_path)
+
+    meta_path = os.path.join(folder, "meta.txt")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        f.write(
+            f"id={item_id}\nname={name}\nemail={email}\ncompany={company}\n"
+            f"original_filename={file.filename}\n"
+            f"uploaded_at_utc={datetime.datetime.utcnow().isoformat()}Z\n"
         )
+
+    return (
+        jsonify(
+            {
+                "status": "ok",
+                "id": item_id,
+                "storage": "local",
+                "folder": folder,
+                "pdf_path": pdf_path,
+                "meta_path": meta_path,
+            }
+        ),
+        201,
+    )
 
 
 # =========================
