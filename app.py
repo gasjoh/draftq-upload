@@ -37,7 +37,12 @@ USE_S3 = all([S3_BUCKET, S3_REGION, S3_ACCESS_KEY, S3_SECRET_KEY, boto3 is not N
 # Flask app
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_FILE_MB * 1024 * 1024
-CORS(app, origins=[ALLOWED_ORIGIN])  # ✅ Enable CORS for your site only
+CORS(app, origins=[
+    "https://www.draftq.ae",
+    "http://www.draftq.ae",
+    "https://draftq.ae",
+    "http://draftq.ae"
+])
 
 
 # =========================
